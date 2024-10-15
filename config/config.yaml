@@ -1,0 +1,59 @@
+# config/config.yaml
+
+model:
+  name: 'siamese_unet'  # Options: 'siamese_unet', 'change_detection_transformer'
+  encoder_name: 'resnet50'  # Only required for 'change_detection_transformer'
+  num_classes: 1
+  use_peft: false  # Set to true if using PEFT (Parameter-Efficient Fine-Tuning)
+  peft_config: {}
+  in_channels: 3
+  out_channels: 1
+  feature_maps: [64, 128, 256, 512]
+
+training:
+  loss_function: 'dice'  # Options: 'bce', 'dice', 'iou', 'focal'
+  loss_kwargs:
+    smooth: 1.0  # Used in DiceLoss and IoULoss
+  metrics:
+    - 'accuracy'
+    - 'precision'
+    - 'recall'
+    - 'f1'
+    - 'iou'
+    - 'dice'
+  use_huggingface_trainer: false
+  huggingface_args: {}
+  checkpoint_path: null  # Path to a checkpoint file to resume training
+  checkpoint_dir: 'checkpoints/'  # Directory to save checkpoints
+  num_epochs: 20
+  learning_rate: 0.001
+  batch_size: 16
+  device: 'cuda'  # Options: 'cuda', 'cpu', or null for automatic detection
+
+data:
+  train_image_pairs:
+    - ['path/to/train_image1_before.png', 'path/to/train_image1_after.png']
+    - ['path/to/train_image2_before.png', 'path/to/train_image2_after.png']
+    # Add more training image pairs as needed
+  train_labels:
+    - 'path/to/train_label1.png'
+    - 'path/to/train_label2.png'
+    # Add more training labels corresponding to image pairs
+  val_image_pairs:
+    - ['path/to/val_image1_before.png', 'path/to/val_image1_after.png']
+    - ['path/to/val_image2_before.png', 'path/to/val_image2_after.png']
+    # Add more validation image pairs as needed
+  val_labels:
+    - 'path/to/val_label1.png'
+    - 'path/to/val_label2.png'
+    # Add more validation labels corresponding to image pairs
+  use_s3: false  # Set to true if using S3 storage
+  s3_bucket: null
+  s3_prefix: null
+  num_workers: 4
+  cache_transforms: false
+  retry_attempts: 3
+  retry_delay: 1.0
+
+metrics:
+  threshold: 0.5  # Threshold for binarization in metrics computation

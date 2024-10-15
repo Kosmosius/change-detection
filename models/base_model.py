@@ -1,11 +1,12 @@
 # models/base_model.py
 
 from abc import ABC, abstractmethod
-import torch.nn as nn
-import torch
 import logging
 from typing import Tuple, Optional
-from torchsummary import summary
+
+import torch
+import torch.nn as nn
+from torchinfo import summary  # Replaced torchsummary with torchinfo
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +15,7 @@ class BaseModel(nn.Module, ABC):
     """
     Abstract Base Model class that all models should inherit from.
     Defines the interface and common functionalities.
-    
+
     Attributes:
         device (torch.device): The device on which the model is running.
     """
@@ -22,25 +23,21 @@ class BaseModel(nn.Module, ABC):
     def __init__(self, device: Optional[torch.device] = None):
         """
         Initializes the BaseModel with device configuration.
-        
+
         Args:
-            device (torch.device, optional): The device to run the model on.
+            device (Optional[torch.device]): The device to run the model on.
                 If None, automatically selects CUDA if available, else CPU.
         """
-        super(BaseModel, self).__init__()
-        self.device: torch.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Model initialized on device: {self.device}")
+        super().__init__()
+        self.device: torch.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info("Model initialized on device: %s", self.device)
 
     @abstractmethod
     def forward(self, *args, **kwargs) -> torch.Tensor:
         """
         Forward pass of the model.
         Must be implemented by all subclasses.
-        
-        Args:
-            *args: Variable length argument list.
-            **kwargs: Arbitrary keyword arguments.
-        
+
         Returns:
             torch.Tensor: The output tensor of the model.
         """
@@ -49,14 +46,14 @@ class BaseModel(nn.Module, ABC):
     def to_device(self, device: Optional[torch.device] = None) -> None:
         """
         Moves the model to the specified device.
-        
+
         Args:
-            device (torch.device, optional): The device to move the model to.
+            device (Optional[torch.device]): The device to move the model to.
                 If None, uses the device attribute of the model.
         """
-        target_device = device if device else self.device
+        target_device = device or self.device
         self.to(target_device)
-        logger.info(f"Model moved to device: {target_device}")
+        logger.info("Model moved to device: %s", target_device)
 
     def freeze_parameters(self) -> None:
         """
@@ -65,7 +62,7 @@ class BaseModel(nn.Module, ABC):
         """
         for param in self.parameters():
             param.requires_grad = False
-        logger.info("All model parameters have been frozen.")
+        logger.debug("All model parameters have been frozen.")
 
     def unfreeze_parameters(self) -> None:
         """
@@ -74,47 +71,44 @@ class BaseModel(nn.Module, ABC):
         """
         for param in self.parameters():
             param.requires_grad = True
-        logger.info("All model parameters have been unfrozen.")
+        logger.debug("All model parameters have been unfrozen.")
 
     def count_parameters(self) -> int:
         """
         Counts the number of trainable parameters in the model.
-        
+
         Returns:
             int: Number of trainable parameters.
         """
         total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        logger.info(f"Total trainable parameters: {total_params}")
+        logger.info("Total trainable parameters: %d", total_params)
         return total_params
 
-    def summary(self) -> None:
+    def summary(self, input_size: Optional[Tuple[int, ...]] = None, batch_size: int = 1) -> None:
         """
         Prints a summary of the model architecture and parameter count.
-        Requires that `get_input_size` is implemented by the subclass.
-        
-        Raises:
-            NotImplementedError: If `get_input_size` is not implemented.
-            ValueError: If `torchsummary` is not installed.
-        """
-        try:
-            input_size = self.get_input_size()
-        except NotImplementedError as e:
-            logger.error(f"Method get_input_size not implemented: {e}")
-            raise
+        Requires that `get_input_size` is implemented by the subclass, or `input_size` is provided.
 
-        try:
-            summary(self, input_size=input_size, device=str(self.device))
-        except Exception as e:
-            logger.error(f"Failed to generate model summary: {e}")
-            raise ValueError("Could not generate model summary. Ensure that torchsummary supports your model architecture.") from e
+        Args:
+            input_size (Optional[Tuple[int, ...]]): Input size in the format (channels, height, width).
+                If None, calls `get_input_size()` to get the input size.
+            batch_size (int): Batch size for the summary. Defaults to 1.
+
+        Raises:
+            NotImplementedError: If `get_input_size` is not implemented and `input_size` is not provided.
+        """
+        if input_size is None:
+            input_size = self.get_input_size()
+        input_shape = (batch_size, *input_size)
+        summary(self, input_size=input_shape, device=str(self.device))
 
     @abstractmethod
-    def get_input_size(self) -> Tuple[int, int, int]:
+    def get_input_size(self) -> Tuple[int, ...]:
         """
         Returns the expected input size for the model.
         Must be implemented by all subclasses.
-        
+
         Returns:
-            Tuple[int, int, int]: Input size in the format (channels, height, width).
+            Tuple[int, ...]: Input size in the format (channels, height, width).
         """
         pass

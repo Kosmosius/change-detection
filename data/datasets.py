@@ -1,15 +1,15 @@
 # data/datasets.py
 
 import os
+import time  # Added missing import for time.sleep
 from pathlib import Path
 from typing import List, Tuple, Optional, Union
 from PIL import Image, ImageFile
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from data.s3_data_loader import S3DataLoader
+from .s3_data_loader import S3DataLoader
 import logging
-from functools import partial
 
 # To handle truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -34,6 +34,7 @@ class ChangeDetectionDataset(Dataset):
         s3_bucket: Optional[str] = None,
         s3_prefix: Optional[str] = None,
         cache_transforms: bool = False,
+        transform_cache_dir: Optional[Union[str, Path]] = None,
         retry_attempts: int = 3,
         retry_delay: float = 1.0
     ):
@@ -43,15 +44,22 @@ class ChangeDetectionDataset(Dataset):
         Args:
             image_pairs (List[Tuple[str, str]]): List of tuples containing paths to before and after images.
             labels (List[str]): List of paths to label images.
-            transform (transforms.Compose, optional): Transformations to apply to the images.
+            transform (Optional[transforms.Compose]): Transformations to apply to the images.
             use_s3 (bool): Whether to load images from AWS S3.
-            s3_bucket (str, optional): S3 bucket name.
-            s3_prefix (str, optional): S3 prefix/path.
+            s3_bucket (Optional[str]): S3 bucket name.
+            s3_prefix (Optional[str]): S3 prefix/path.
             cache_transforms (bool): Whether to cache transformed images for faster loading.
+            transform_cache_dir (Optional[Union[str, Path]]): Directory to cache transformed images.
             retry_attempts (int): Number of retry attempts for loading images.
             retry_delay (float): Delay between retry attempts in seconds.
+
+        Raises:
+            ValueError: If input lists are of unequal length or required parameters are missing.
         """
-        assert len(image_pairs) == len(labels), "Number of image pairs must match number of labels."
+        if len(image_pairs) != len(labels):
+            logger.error("Number of image pairs must match number of labels.")
+            raise ValueError("Number of image pairs must match number of labels.")
+
         self.image_pairs = image_pairs
         self.labels = labels
         self.transform = transform
@@ -61,15 +69,20 @@ class ChangeDetectionDataset(Dataset):
         self.retry_delay = retry_delay
 
         if self.use_s3:
-            assert s3_bucket is not None and s3_prefix is not None, "S3 bucket and prefix must be provided when use_s3 is True."
+            if not s3_bucket or not s3_prefix:
+                logger.error("S3 bucket and prefix must be provided when use_s3 is True.")
+                raise ValueError("S3 bucket and prefix must be provided when use_s3 is True.")
             self.s3_loader = S3DataLoader(bucket_name=s3_bucket, prefix=s3_prefix)
             logger.info("Initialized S3DataLoader for dataset.")
 
         # Initialize transformation caching if enabled
         if self.cache_transforms and self.transform:
-            self.transform_cache_dir = Path("cache/transformed_images")
+            if not transform_cache_dir:
+                logger.error("transform_cache_dir must be provided when cache_transforms is True.")
+                raise ValueError("transform_cache_dir must be provided when cache_transforms is True.")
+            self.transform_cache_dir = Path(transform_cache_dir)
             self.transform_cache_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Transformation caching enabled. Cache directory: {self.transform_cache_dir}")
+            logger.info("Transformation caching enabled. Cache directory: %s", self.transform_cache_dir)
 
     def __len__(self) -> int:
         return len(self.image_pairs)
@@ -82,9 +95,13 @@ class ChangeDetectionDataset(Dataset):
             idx (int): Index of the sample to retrieve.
 
         Returns:
-            Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]: 
+            Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
                 - Tuple of before and after images as tensors.
                 - Label image as a tensor.
+
+        Raises:
+            FileNotFoundError: If image files are not found.
+            IOError: If images cannot be opened or are corrupted.
         """
         before_path, after_path = self.image_pairs[idx]
         label_path = self.labels[idx]
@@ -94,8 +111,8 @@ class ChangeDetectionDataset(Dataset):
             before_img = self._load_image(before_path, mode="RGB")
             after_img = self._load_image(after_path, mode="RGB")
             label_img = self._load_image(label_path, mode="L")  # Assuming label is grayscale
-        except Exception as e:
-            logger.error(f"Error loading images for index {idx}: {e}")
+        except (FileNotFoundError, IOError) as e:
+            logger.error("Error loading images for index %d: %s", idx, e)
             raise
 
         # Apply transformations with optional caching
@@ -126,13 +143,13 @@ class ChangeDetectionDataset(Dataset):
                 else:
                     img = Image.open(path).convert(mode)
                 return img
-            except Exception as e:
-                logger.warning(f"Attempt {attempt} failed to load image '{path}': {e}")
+            except (FileNotFoundError, IOError) as e:
+                logger.warning("Attempt %d failed to load image '%s': %s", attempt, path, e)
                 if attempt < self.retry_attempts:
-                    logger.info(f"Retrying in {self.retry_delay} seconds...")
+                    logger.info("Retrying in %.2f seconds...", self.retry_delay)
                     time.sleep(self.retry_delay)
                 else:
-                    logger.error(f"All {self.retry_attempts} attempts failed to load image '{path}'.")
+                    logger.error("All %d attempts failed to load image '%s'.", self.retry_attempts, path)
                     raise
 
     def _apply_transforms(
@@ -144,6 +161,8 @@ class ChangeDetectionDataset(Dataset):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Applies transformations to the images with optional caching.
+
+        Ensures that the same random transformations are applied to both images and labels.
 
         Args:
             idx (int): Index of the sample.
@@ -159,66 +178,40 @@ class ChangeDetectionDataset(Dataset):
             if cache_path.is_file():
                 try:
                     before_tensor, after_tensor, label_tensor = torch.load(cache_path)
-                    logger.debug(f"Loaded transformed images from cache for index {idx}.")
+                    logger.debug("Loaded transformed images from cache for index %d.", idx)
                     return before_tensor, after_tensor, label_tensor
-                except Exception as e:
-                    logger.warning(f"Failed to load cached transforms for index {idx}: {e}. Re-transforming.")
+                except (OSError, IOError) as e:
+                    logger.warning("Failed to load cached transforms for index %d: %s. Re-transforming.", idx, e)
 
+        # Apply the same transformations to images and labels
+        seed = torch.randint(0, 2**32, (1,)).item()
+
+        torch.manual_seed(seed)
         before_tensor = self.transform(before_img)
+
+        torch.manual_seed(seed)
         after_tensor = self.transform(after_img)
-        label_tensor = transforms.ToTensor()(label_img)  # Convert label to tensor without normalization
+
+        torch.manual_seed(seed)
+        # For labels, we need to ensure that ToTensor does not normalize the data
+        label_transform = transforms.Compose([
+            transforms.Resize(self.transform.transforms[0].size),
+            transforms.RandomHorizontalFlip() if any(isinstance(t, transforms.RandomHorizontalFlip) for t in self.transform.transforms) else None,
+            transforms.RandomVerticalFlip() if any(isinstance(t, transforms.RandomVerticalFlip) for t in self.transform.transforms) else None,
+            transforms.RandomRotation(self.transform.transforms[2].degrees) if any(isinstance(t, transforms.RandomRotation) for t in self.transform.transforms) else None,
+            transforms.ToTensor()
+        ])
+        label_transform.transforms = [t for t in label_transform.transforms if t is not None]
+        label_tensor = label_transform(label_img).long().squeeze(0)  # Convert to tensor without normalization
 
         if self.cache_transforms:
             try:
                 torch.save((before_tensor, after_tensor, label_tensor), cache_path)
-                logger.debug(f"Saved transformed images to cache for index {idx}.")
-            except Exception as e:
-                logger.warning(f"Failed to save transformed images to cache for index {idx}: {e}.")
+                logger.debug("Saved transformed images to cache for index %d.", idx)
+            except (OSError, IOError) as e:
+                logger.warning("Failed to save transformed images to cache for index %d: %s.", idx, e)
 
         return before_tensor, after_tensor, label_tensor
-
-
-def get_default_transforms(
-    resize: Tuple[int, int] = (256, 256),
-    horizontal_flip: bool = True,
-    vertical_flip: bool = True,
-    rotation_degree: int = 15,
-    normalize: bool = True,
-    mean: List[float] = [0.485, 0.456, 0.406],
-    std: List[float] = [0.229, 0.224, 0.225]
-) -> transforms.Compose:
-    """
-    Returns the default set of transformations to apply to the images.
-
-    Args:
-        resize (Tuple[int, int], optional): Resize dimensions. Defaults to (256, 256).
-        horizontal_flip (bool, optional): Whether to apply horizontal flip. Defaults to True.
-        vertical_flip (bool, optional): Whether to apply vertical flip. Defaults to True.
-        rotation_degree (int, optional): Maximum degree for random rotations. Defaults to 15.
-        normalize (bool, optional): Whether to apply normalization. Defaults to True.
-        mean (List[float], optional): Mean values for normalization. Defaults to ImageNet means.
-        std (List[float], optional): Standard deviation for normalization. Defaults to ImageNet std.
-
-    Returns:
-        transforms.Compose: Composed transformations.
-    """
-    transform_list = [
-        transforms.Resize(resize),
-    ]
-
-    if horizontal_flip:
-        transform_list.append(transforms.RandomHorizontalFlip())
-    if vertical_flip:
-        transform_list.append(transforms.RandomVerticalFlip())
-    if rotation_degree > 0:
-        transform_list.append(transforms.RandomRotation(rotation_degree))
-
-    transform_list.append(transforms.ToTensor())
-
-    if normalize:
-        transform_list.append(transforms.Normalize(mean=mean, std=std))
-
-    return transforms.Compose(transform_list)
 
 
 def get_dataloader(
@@ -230,8 +223,9 @@ def get_dataloader(
     use_s3: bool = False,
     s3_bucket: Optional[str] = None,
     s3_prefix: Optional[str] = None,
-    num_workers: int = 4,
+    num_workers: int = 0,  # Set to 0 for compatibility on Windows
     cache_transforms: bool = False,
+    transform_cache_dir: Optional[Union[str, Path]] = None,
     retry_attempts: int = 3,
     retry_delay: float = 1.0
 ) -> DataLoader:
@@ -243,18 +237,24 @@ def get_dataloader(
         labels (List[str]): List of label paths.
         batch_size (int, optional): Number of samples per batch. Defaults to 32.
         shuffle (bool, optional): Whether to shuffle the data. Defaults to True.
-        transform (transforms.Compose, optional): Transformations to apply. Defaults to None.
+        transform (Optional[transforms.Compose], optional): Transformations to apply. Defaults to None.
         use_s3 (bool, optional): Whether to load images from AWS S3. Defaults to False.
-        s3_bucket (str, optional): S3 bucket name. Defaults to None.
-        s3_prefix (str, optional): S3 prefix/path. Defaults to None.
-        num_workers (int, optional): Number of subprocesses for data loading. Defaults to 4.
+        s3_bucket (Optional[str], optional): S3 bucket name. Defaults to None.
+        s3_prefix (Optional[str], optional): S3 prefix/path. Defaults to None.
+        num_workers (int, optional): Number of subprocesses for data loading. Defaults to 0.
         cache_transforms (bool, optional): Whether to cache transformed images. Defaults to False.
+        transform_cache_dir (Optional[Union[str, Path]], optional): Directory to cache transformed images. Required if cache_transforms is True.
         retry_attempts (int, optional): Number of retry attempts for loading images. Defaults to 3.
         retry_delay (float, optional): Delay between retry attempts in seconds. Defaults to 1.0.
 
     Returns:
         DataLoader: Configured DataLoader.
+
+    Raises:
+        ValueError: If required parameters are missing.
     """
+    from .transforms import get_default_transforms  # Import from transforms module
+
     if transform is None:
         transform = get_default_transforms()
 
@@ -266,6 +266,7 @@ def get_dataloader(
         s3_bucket=s3_bucket,
         s3_prefix=s3_prefix,
         cache_transforms=cache_transforms,
+        transform_cache_dir=transform_cache_dir,
         retry_attempts=retry_attempts,
         retry_delay=retry_delay
     )
@@ -278,5 +279,10 @@ def get_dataloader(
         pin_memory=True
     )
 
-    logger.info(f"DataLoader created with batch_size={batch_size}, shuffle={shuffle}, num_workers={num_workers}.")
+    logger.info(
+        "DataLoader created with batch_size=%d, shuffle=%s, num_workers=%d.",
+        batch_size,
+        shuffle,
+        num_workers
+    )
     return dataloader

@@ -1,13 +1,68 @@
 # models/siamese_unet.py
 
+import logging
+from typing import List, Tuple, Optional
+
 import torch
 import torch.nn as nn
-import logging
-from typing import List, Tuple, Optional, Union
 
-from models.base_model import BaseModel
+from .base_model import BaseModel
 
 logger = logging.getLogger(__name__)
+
+
+class DoubleConv(nn.Module):
+    """(Convolution => [BN] => ReLU) * 2"""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        layers = [
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),  # Optional: remove if not using batch normalization
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),  # Optional
+            nn.ReLU(inplace=True),
+        ]
+        self.double_conv = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.double_conv(x)
+
+
+class Down(nn.Module):
+    """Downscaling with maxpool then double conv"""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_channels, out_channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.maxpool_conv(x)
+
+
+class Up(nn.Module):
+    """Upscaling then double conv"""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_channels // 2, in_channels // 2, kernel_size=2, stride=2)
+        self.conv = DoubleConv(in_channels, out_channels)
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        x1 = self.up(x1)
+
+        # Adjust shape if necessary
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+        x1 = nn.functional.pad(x1, [diffX // 2, diffX - diffX // 2,
+                                    diffY // 2, diffY - diffY // 2])
+
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
 
 
 class SiameseUNet(BaseModel):
@@ -31,80 +86,46 @@ class SiameseUNet(BaseModel):
                 Defaults to 3 (RGB images).
             out_channels (int): Number of output channels (e.g., 1 for binary change detection).
                 Defaults to 1.
-            feature_maps (List[int], optional): List defining the number of feature maps at each layer.
+            feature_maps (Optional[List[int]]): List defining the number of feature maps at each layer.
                 Defaults to [64, 128, 256, 512].
-            device (torch.device, optional): Device to run the model on.
+            device (Optional[torch.device]): Device to run the model on.
                 If None, uses the default device from BaseModel.
+
+        Raises:
+            ValueError: If input parameters are invalid.
         """
-        super(SiameseUNet, self).__init__(device=device)
-        self.in_channels: int = in_channels
-        self.out_channels: int = out_channels
-        self.feature_maps: List[int] = feature_maps if feature_maps else [64, 128, 256, 512]
+        super().__init__(device=device)
 
-        # Shared Encoder
-        self.encoder: nn.Sequential = self._build_encoder()
+        if in_channels <= 0:
+            raise ValueError("in_channels must be a positive integer.")
+        if out_channels <= 0:
+            raise ValueError("out_channels must be a positive integer.")
+        if feature_maps is None:
+            feature_maps = [64, 128, 256, 512]
+        elif not all(isinstance(fm, int) and fm > 0 for fm in feature_maps):
+            raise ValueError("feature_maps must be a list of positive integers.")
 
-        # Shared Decoder
-        self.decoder: nn.Module = self._build_decoder()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.feature_maps = feature_maps
 
-        # Final Convolution
-        self.final_conv: nn.Conv2d = nn.Conv2d(self.feature_maps[0], self.out_channels, kernel_size=1)
+        # Build the encoder and decoder
+        self.inc = DoubleConv(self.in_channels, self.feature_maps[0])
+        self.down1 = Down(self.feature_maps[0], self.feature_maps[1])
+        self.down2 = Down(self.feature_maps[1], self.feature_maps[2])
+        self.down3 = Down(self.feature_maps[2], self.feature_maps[3])
+
+        # Bottleneck
+        self.bottleneck = DoubleConv(self.feature_maps[3], self.feature_maps[3])
+
+        # Upsampling
+        self.up1 = Up(self.feature_maps[3] * 2, self.feature_maps[2])
+        self.up2 = Up(self.feature_maps[2] * 2, self.feature_maps[1])
+        self.up3 = Up(self.feature_maps[1] * 2, self.feature_maps[0])
+
+        self.outc = nn.Conv2d(self.feature_maps[0], self.out_channels, kernel_size=1)
 
         logger.info("Initialized SiameseUNet architecture.")
-
-    def _build_encoder(self) -> nn.Sequential:
-        """
-        Builds the shared encoder part of the Siamese U-Net.
-
-        Returns:
-            nn.Sequential: Encoder network.
-        """
-        try:
-            layers: List[nn.Module] = []
-            prev_channels: int = self.in_channels
-            for idx, fm in enumerate(self.feature_maps):
-                layers.append(nn.Conv2d(prev_channels, fm, kernel_size=3, padding=1))
-                layers.append(nn.BatchNorm2d(fm))
-                layers.append(nn.ReLU(inplace=True))
-                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
-                logger.debug(f"Encoder Layer {idx + 1}: Conv2d({prev_channels}, {fm}, 3, 1), "
-                             f"BatchNorm2d({fm}), ReLU, MaxPool2d(2)")
-                prev_channels = fm
-            encoder = nn.Sequential(*layers)
-            logger.info("Shared encoder built successfully.")
-            return encoder
-        except Exception as e:
-            logger.error(f"Failed to build encoder: {e}")
-            raise ValueError("Invalid encoder configuration.") from e
-
-    def _build_decoder(self) -> nn.Module:
-        """
-        Builds the shared decoder part of the Siamese U-Net.
-
-        Returns:
-            nn.Sequential: Decoder network.
-        """
-        try:
-            layers: List[nn.Module] = []
-            reversed_features: List[int] = list(reversed(self.feature_maps[:-1]))
-            prev_channels: int = self.feature_maps[-1]
-            for idx, fm in enumerate(reversed_features):
-                layers.append(nn.ConvTranspose2d(prev_channels, fm, kernel_size=2, stride=2))
-                layers.append(nn.BatchNorm2d(fm))
-                layers.append(nn.ReLU(inplace=True))
-                layers.append(nn.Conv2d(fm * 2, fm, kernel_size=3, padding=1))
-                layers.append(nn.BatchNorm2d(fm))
-                layers.append(nn.ReLU(inplace=True))
-                logger.debug(f"Decoder Layer {idx + 1}: ConvTranspose2d({prev_channels}, {fm}, 2, 2), "
-                             f"BatchNorm2d({fm}), ReLU, Conv2d({fm * 2}, {fm}, 3, 1), "
-                             f"BatchNorm2d({fm}), ReLU")
-                prev_channels = fm
-            decoder = nn.Sequential(*layers)
-            logger.info("Shared decoder built successfully.")
-            return decoder
-        except Exception as e:
-            logger.error(f"Failed to build decoder: {e}")
-            raise ValueError("Invalid decoder configuration.") from e
 
     def forward(
         self,
@@ -112,7 +133,7 @@ class SiameseUNet(BaseModel):
         img2: torch.Tensor
     ) -> torch.Tensor:
         """
-        Forward pass of the Siamese U-Net model with concatenated encoder outputs.
+        Forward pass of the Siamese U-Net model with skip connections.
 
         Args:
             img1 (torch.Tensor): First input image tensor of shape (batch_size, channels, height, width).
@@ -120,58 +141,86 @@ class SiameseUNet(BaseModel):
 
         Returns:
             torch.Tensor: Output change map tensor of shape (batch_size, out_channels, height, width).
+
+        Raises:
+            ValueError: If input tensors have incompatible shapes.
         """
-        try:
-            # Move inputs to the correct device
-            img1 = img1.to(self.device)
-            img2 = img2.to(self.device)
-            logger.debug("Input images moved to device.")
+        if img1.shape != img2.shape:
+            raise ValueError("Input tensors img1 and img2 must have the same shape.")
+        if img1.dim() != 4:
+            raise ValueError("Input tensors must be 4-dimensional (batch_size, channels, height, width).")
 
-            # Pass both images through the shared encoder
-            enc1 = self.encoder(img1)
-            enc2 = self.encoder(img2)
-            logger.debug("Images passed through the encoder.")
+        # Encoder path for img1
+        x1 = self.inc(img1)
+        x1_down1 = self.down1(x1)
+        x1_down2 = self.down2(x1_down1)
+        x1_down3 = self.down3(x1_down2)
+        x1_bottleneck = self.bottleneck(x1_down3)
 
-            # Concatenate encoder outputs along the channel dimension
-            enc = torch.cat([enc1, enc2], dim=1)  # Shape: (batch_size, 2 * feature_maps[-1], H, W)
-            logger.debug(f"Encoder outputs concatenated. Shape: {enc.shape}")
+        # Encoder path for img2
+        y1 = self.inc(img2)
+        y1_down1 = self.down1(y1)
+        y1_down2 = self.down2(y1_down1)
+        y1_down3 = self.down3(y1_down2)
+        y1_bottleneck = self.bottleneck(y1_down3)
 
-            # Pass through decoder
-            dec = self.decoder(enc)
-            logger.debug(f"Decoder output shape: {dec.shape}")
+        # Compute the difference at the bottleneck
+        diff_bottleneck = torch.abs(x1_bottleneck - y1_bottleneck)
 
-            # Final convolution
-            out = self.final_conv(dec)
-            logger.debug(f"Final convolution output shape: {out.shape}")
+        # Decoder path with skip connections
+        x = self.up1(diff_bottleneck, torch.abs(x1_down3 - y1_down3))
+        x = self.up2(x, torch.abs(x1_down2 - y1_down2))
+        x = self.up3(x, torch.abs(x1_down1 - y1_down1))
+        logits = self.outc(x)
 
-            # Apply sigmoid activation for binary change detection
-            out = torch.sigmoid(out)
-            logger.debug("Sigmoid activation applied to output.")
-
-            return out
-        except Exception as e:
-            logger.error(f"Error during forward pass: {e}")
-            raise
+        return logits
 
     def get_input_size(self) -> Tuple[int, int, int]:
         """
-        Specifies the input size for each image.
+        Returns the expected input size for the model.
 
         Returns:
             Tuple[int, int, int]: Input size in the format (channels, height, width).
         """
         return (self.in_channels, 256, 256)  # Example input size
 
-    def freeze_parameters(self) -> None:
+    def freeze_encoder(self) -> None:
         """
         Freezes the encoder parameters to prevent them from being updated during training.
         """
-        super().freeze_parameters()
-        logger.info("Encoder parameters have been frozen.")
+        for module in [self.inc, self.down1, self.down2, self.down3, self.bottleneck]:
+            for param in module.parameters():
+                param.requires_grad = False
+        logger.debug("Encoder parameters have been frozen.")
 
-    def unfreeze_parameters(self) -> None:
+    def unfreeze_encoder(self) -> None:
         """
         Unfreezes the encoder parameters to allow them to be updated during training.
         """
-        super().unfreeze_parameters()
-        logger.info("Encoder parameters have been unfrozen.")
+        for module in [self.inc, self.down1, self.down2, self.down3, self.bottleneck]:
+            for param in module.parameters():
+                param.requires_grad = True
+        logger.debug("Encoder parameters have been unfrozen.")
+
+    def count_parameters(self) -> int:
+        """
+        Counts the number of trainable parameters in the model.
+
+        Returns:
+            int: Number of trainable parameters.
+        """
+        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        logger.info("Total trainable parameters: %d", total_params)
+        return total_params
+
+    def summary(self) -> None:
+        """
+        Prints a summary of the model architecture and parameter count.
+        """
+        from torchinfo import summary
+        input_size = self.get_input_size()
+        try:
+            summary(self, input_size=[(1, *input_size), (1, *input_size)], device=str(self.device))
+        except Exception as e:
+            logger.error("Failed to generate model summary: %s", e)
+            raise

@@ -3,6 +3,7 @@
 import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, Union
+import torch
 from transformers import (
     AutoModel,
     AutoConfig,
@@ -10,8 +11,7 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizer,
 )
-from peft import PeftModel, LoraConfig, TaskType
-import torch
+from peft import PeftModel, LoraConfig
 
 logger = logging.getLogger(__name__)
 
@@ -23,30 +23,37 @@ def load_huggingface_model(
     model_kwargs: Optional[Dict[str, Any]] = None,
 ) -> PreTrainedModel:
     """
-    Loads a pre-trained HuggingFace model.
+    Loads a HuggingFace model.
 
     Args:
         model_name (str): The name or path of the HuggingFace model.
         pretrained (bool): Whether to load pre-trained weights. Defaults to True.
-        config_kwargs (Dict[str, Any], optional): Additional configuration parameters.
-        model_kwargs (Dict[str, Any], optional): Additional model parameters.
+        config_kwargs (Optional[Dict[str, Any]]): Additional configuration parameters.
+        model_kwargs (Optional[Dict[str, Any]]): Additional model parameters.
 
     Returns:
         PreTrainedModel: The loaded HuggingFace model.
 
     Raises:
-        ValueError: If the model fails to load.
+        FileNotFoundError: If the model files are not found.
+        ValueError: If invalid arguments are provided.
+        RuntimeError: If loading the model fails.
     """
     config_kwargs = config_kwargs or {}
     model_kwargs = model_kwargs or {}
+
     try:
-        config = AutoConfig.from_pretrained(model_name, **config_kwargs) if pretrained else AutoConfig(**config_kwargs)
-        model = AutoModel.from_pretrained(model_name, config=config, **model_kwargs) if pretrained else AutoModel(config, **model_kwargs)
-        logger.info(f"HuggingFace model '{model_name}' loaded successfully.")
+        if pretrained:
+            config = AutoConfig.from_pretrained(model_name, **config_kwargs)
+            model = AutoModel.from_pretrained(model_name, config=config, **model_kwargs)
+        else:
+            config = AutoConfig(**config_kwargs)
+            model = AutoModel(config, **model_kwargs)
+        logger.info("HuggingFace model '%s' loaded successfully.", model_name)
         return model
-    except Exception as e:
-        logger.error(f"Error loading HuggingFace model '{model_name}': {e}")
-        raise ValueError(f"Failed to load HuggingFace model '{model_name}'.") from e
+    except (OSError, ValueError, RuntimeError) as e:
+        logger.error("Error loading HuggingFace model '%s': %s", model_name, e)
+        raise RuntimeError(f"Failed to load HuggingFace model '{model_name}': {e}") from e
 
 
 def apply_peft(
@@ -60,19 +67,21 @@ def apply_peft(
     Args:
         model (PreTrainedModel): The HuggingFace model to fine-tune.
         peft_config (Dict[str, Any]): Configuration dictionary for PEFT.
-        peft_model_name (str, optional): Name or path of the PEFT model to load. Required if applying from a pretrained PEFT model.
+        peft_model_name (Optional[str]): Name or path of the PEFT model to load.
 
     Returns:
         PeftModel: The PEFT-enhanced model.
 
     Raises:
-        ValueError: If PEFT application fails due to missing parameters or incorrect configurations.
+        KeyError: If required keys are missing in peft_config.
+        ValueError: If invalid configuration is provided.
+        RuntimeError: If applying PEFT fails.
     """
     required_keys = {"task_type", "r", "lora_alpha", "lora_dropout", "target_modules"}
-    if not required_keys.issubset(peft_config.keys()):
-        missing = required_keys - peft_config.keys()
-        logger.error(f"PEFT configuration missing keys: {missing}")
-        raise ValueError(f"PEFT configuration missing keys: {missing}")
+    missing_keys = required_keys - peft_config.keys()
+    if missing_keys:
+        logger.error("PEFT configuration missing keys: %s", ', '.join(missing_keys))
+        raise KeyError(f"PEFT configuration missing keys: {', '.join(missing_keys)}")
 
     try:
         lora_config = LoraConfig(
@@ -84,14 +93,14 @@ def apply_peft(
         )
         if peft_model_name:
             peft_model = PeftModel.from_pretrained(model, peft_model_name, config=lora_config)
-            logger.info(f"PEFT model loaded from '{peft_model_name}' and applied successfully.")
+            logger.info("PEFT model loaded from '%s' and applied successfully.", peft_model_name)
         else:
             peft_model = PeftModel(model, lora_config)
             logger.info("PEFT applied to the model successfully.")
         return peft_model
-    except Exception as e:
-        logger.error(f"Error applying PEFT: {e}")
-        raise ValueError("Failed to apply PEFT to the model.") from e
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as e:
+        logger.error("Error applying PEFT: %s", e)
+        raise RuntimeError(f"Failed to apply PEFT: {e}") from e
 
 
 def integrate_huggingface_with_custom_model(
@@ -105,25 +114,25 @@ def integrate_huggingface_with_custom_model(
     Args:
         custom_model (torch.nn.Module): The custom model to integrate with.
         hf_model (PreTrainedModel): The HuggingFace model to integrate.
-        encoder_attr (str, optional): Attribute name in the custom model where the HuggingFace model should be integrated. Defaults to "encoder".
+        encoder_attr (str): Attribute name in the custom model where the HuggingFace model should be integrated.
 
     Returns:
         torch.nn.Module: The integrated model.
 
     Raises:
-        AttributeError: If the custom model does not have the specified encoder attribute.
+        AttributeError: If the custom model does not have the specified encoder attribute or if setting the attribute fails.
     """
     if not hasattr(custom_model, encoder_attr):
-        logger.error(f"Custom model does not have an attribute '{encoder_attr}'.")
+        logger.error("Custom model does not have an attribute '%s'.", encoder_attr)
         raise AttributeError(f"Custom model does not have an attribute '{encoder_attr}'.")
-    
+
     try:
         setattr(custom_model, encoder_attr, hf_model)
-        logger.info(f"HuggingFace model integrated into '{encoder_attr}' attribute of the custom model successfully.")
+        logger.info("HuggingFace model integrated into '%s' attribute of the custom model successfully.", encoder_attr)
         return custom_model
-    except Exception as e:
-        logger.error(f"Error integrating HuggingFace model into custom model: {e}")
-        raise ValueError("Failed to integrate HuggingFace model into custom model.") from e
+    except AttributeError as e:
+        logger.error("Error integrating HuggingFace model into custom model: %s", e)
+        raise
 
 
 def save_huggingface_model(
@@ -137,22 +146,23 @@ def save_huggingface_model(
 
     Args:
         model (PreTrainedModel): The HuggingFace model to save.
-        save_directory (str or Path): The directory where the model will be saved.
-        model_name (str, optional): The name of the saved model directory. Defaults to "custom_model".
-        save_config (bool, optional): Whether to save the model configuration. Defaults to True.
+        save_directory (Union[str, Path]): The directory where the model will be saved.
+        model_name (str): The name of the saved model directory.
+        save_config (bool): Whether to save the model configuration.
 
     Raises:
-        ValueError: If saving the model fails.
+        OSError: If saving the model fails due to an OS error.
+        IOError: If an I/O operation fails.
     """
     save_directory = Path(save_directory)
     save_path = save_directory / model_name
     try:
         save_path.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(save_path, save_config=save_config)
-        logger.info(f"HuggingFace model saved to '{save_path}'.")
-    except Exception as e:
-        logger.error(f"Error saving HuggingFace model to '{save_path}': {e}")
-        raise ValueError(f"Failed to save HuggingFace model to '{save_path}'.") from e
+        logger.info("HuggingFace model saved to '%s'.", save_path)
+    except (OSError, IOError) as e:
+        logger.error("Error saving HuggingFace model to '%s': %s", save_path, e)
+        raise
 
 
 def load_peft_model(
@@ -163,22 +173,31 @@ def load_peft_model(
     Loads a PEFT-enhanced HuggingFace model from the specified path.
 
     Args:
-        model_path (str or Path): The path to the PEFT model directory.
-        peft_config (Dict[str, Any], optional): Configuration dictionary for PEFT. Required if not loading from a pretrained PEFT model.
+        model_path (Union[str, Path]): The path to the PEFT model directory.
+        peft_config (Optional[Dict[str, Any]]): Configuration dictionary for PEFT.
 
     Returns:
         PeftModel: The loaded PEFT model.
 
     Raises:
-        ValueError: If loading the PEFT model fails.
+        FileNotFoundError: If the model directory does not exist.
+        KeyError: If required keys are missing in peft_config.
+        ValueError: If invalid configuration is provided.
+        RuntimeError: If loading the PEFT model fails.
     """
     model_path = Path(model_path)
     if not model_path.is_dir():
-        logger.error(f"PEFT model directory '{model_path}' does not exist.")
-        raise ValueError(f"PEFT model directory '{model_path}' does not exist.")
-    
+        logger.error("PEFT model directory '%s' does not exist.", model_path)
+        raise FileNotFoundError(f"PEFT model directory '{model_path}' does not exist.")
+
     try:
         if peft_config:
+            required_keys = {"task_type", "r", "lora_alpha", "lora_dropout", "target_modules"}
+            missing_keys = required_keys - peft_config.keys()
+            if missing_keys:
+                logger.error("PEFT configuration missing keys: %s", ', '.join(missing_keys))
+                raise KeyError(f"PEFT configuration missing keys: {', '.join(missing_keys)}")
+
             lora_config = LoraConfig(
                 task_type=peft_config["task_type"],
                 r=peft_config["r"],
@@ -187,14 +206,14 @@ def load_peft_model(
                 target_modules=peft_config["target_modules"],
             )
             peft_model = PeftModel.from_pretrained(model_path, config=lora_config)
-            logger.info(f"PEFT model loaded from '{model_path}' with provided configuration.")
+            logger.info("PEFT model loaded from '%s' with provided configuration.", model_path)
         else:
             peft_model = PeftModel.from_pretrained(model_path)
-            logger.info(f"PEFT model loaded from '{model_path}' successfully.")
+            logger.info("PEFT model loaded from '%s' successfully.", model_path)
         return peft_model
-    except Exception as e:
-        logger.error(f"Error loading PEFT model from '{model_path}': {e}")
-        raise ValueError(f"Failed to load PEFT model from '{model_path}'.") from e
+    except (OSError, IOError, ValueError, RuntimeError, KeyError, TypeError) as e:
+        logger.error("Error loading PEFT model from '%s': %s", model_path, e)
+        raise
 
 
 def get_huggingface_tokenizer(
@@ -206,19 +225,21 @@ def get_huggingface_tokenizer(
 
     Args:
         tokenizer_name (str): The name or path of the HuggingFace tokenizer.
-        tokenizer_kwargs (Dict[str, Any], optional): Additional arguments to pass to the tokenizer constructor.
+        tokenizer_kwargs (Optional[Dict[str, Any]]): Additional arguments to pass to the tokenizer constructor.
 
     Returns:
         PreTrainedTokenizer: The loaded tokenizer.
 
     Raises:
-        ValueError: If the tokenizer fails to load.
+        FileNotFoundError: If the tokenizer files are not found.
+        ValueError: If invalid arguments are provided.
+        RuntimeError: If loading the tokenizer fails.
     """
     tokenizer_kwargs = tokenizer_kwargs or {}
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **tokenizer_kwargs)
-        logger.info(f"HuggingFace tokenizer '{tokenizer_name}' loaded successfully.")
+        logger.info("HuggingFace tokenizer '%s' loaded successfully.", tokenizer_name)
         return tokenizer
-    except Exception as e:
-        logger.error(f"Error loading HuggingFace tokenizer '{tokenizer_name}': {e}")
-        raise ValueError(f"Failed to load HuggingFace tokenizer '{tokenizer_name}'.") from e
+    except (OSError, ValueError, RuntimeError) as e:
+        logger.error("Error loading HuggingFace tokenizer '%s': %s", tokenizer_name, e)
+        raise

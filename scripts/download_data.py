@@ -1,9 +1,9 @@
 # scripts/download_data.py
 
 import logging
-import os
 import sys
 import time
+from pathlib import Path
 from typing import List, Tuple, Optional
 
 import boto3
@@ -13,24 +13,33 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils.config_parser import get_config
 from utils.logger import setup_logger
 
+# Initialize the logger at the module level
+logger = logging.getLogger(__name__)
 
-def create_local_directory(file_path: str) -> None:
+
+def create_local_directory(file_path: Path) -> None:
     """
     Create the local directory for the given file path if it does not exist.
 
     Parameters
     ----------
-    file_path : str
+    file_path : Path
         The full path to the file for which the directory needs to be created.
     """
-    directory = os.path.dirname(file_path)
-    if not os.path.exists(directory):
-        os.makedirs(directory, exist_ok=True)
+    directory = file_path.parent
+    if not directory.exists():
+        directory.mkdir(parents=True, exist_ok=True)
         logger.debug("Created directory: %s", directory)
 
 
-def download_file_from_s3(s3_client, bucket: str, s3_key: str, local_path: str,
-                          retry_attempts: int, retry_delay: float) -> None:
+def download_file_from_s3(
+    s3_client,
+    bucket: str,
+    s3_key: str,
+    local_path: Path,
+    retry_attempts: int,
+    retry_delay: float
+) -> None:
     """
     Download a single file from S3 to a local path with retry logic.
 
@@ -42,7 +51,7 @@ def download_file_from_s3(s3_client, bucket: str, s3_key: str, local_path: str,
         The name of the S3 bucket.
     s3_key : str
         The key of the S3 object to download.
-    local_path : str
+    local_path : Path
         The local file path where the object will be saved.
     retry_attempts : int
         Number of retry attempts in case of failure.
@@ -56,20 +65,28 @@ def download_file_from_s3(s3_client, bucket: str, s3_key: str, local_path: str,
     """
     for attempt in range(1, retry_attempts + 1):
         try:
-            logger.debug("Attempting to download %s to %s (Attempt %d)", s3_key, local_path, attempt)
-            s3_client.download_file(bucket, s3_key, local_path)
+            logger.debug(
+                "Attempting to download %s to %s (Attempt %d)", s3_key, local_path, attempt
+            )
+            s3_client.download_file(bucket, s3_key, str(local_path))
             logger.info("Successfully downloaded %s to %s", s3_key, local_path)
             return
         except (ClientError, EndpointConnectionError, NoCredentialsError) as e:
-            logger.warning("Failed to download %s (Attempt %d/%d): %s", s3_key, attempt, retry_attempts, e)
+            logger.warning(
+                "Failed to download %s (Attempt %d/%d): %s",
+                s3_key,
+                attempt,
+                retry_attempts,
+                e,
+            )
             if attempt < retry_attempts:
                 time.sleep(retry_delay)
             else:
                 logger.error("Exceeded maximum retry attempts for %s", s3_key)
-                raise e
+                raise
 
 
-def map_s3_key(s3_prefix: Optional[str], local_path: str) -> str:
+def map_s3_key(s3_prefix: Optional[str], local_path: Path, base_dir: Path) -> str:
     """
     Map a local file path to its corresponding S3 key based on the provided S3 prefix.
 
@@ -77,24 +94,25 @@ def map_s3_key(s3_prefix: Optional[str], local_path: str) -> str:
     ----------
     s3_prefix : Optional[str]
         The prefix in the S3 bucket where the data is stored.
-    local_path : str
+    local_path : Path
         The local file path.
+    base_dir : Path
+        The base directory to calculate relative paths.
 
     Returns
     -------
     str
         The corresponding S3 key.
     """
+    relative_path = local_path.relative_to(base_dir).as_posix()
     if s3_prefix:
-        # Remove leading '/' if present in local_path to avoid issues with S3 keys
-        relative_path = os.path.relpath(local_path, start=os.path.commonpath([local_path]))
-        s3_key = os.path.join(s3_prefix, relative_path).replace("\\", "/")
+        s3_key = f"{s3_prefix}/{relative_path}".replace("//", "/")
     else:
-        s3_key = local_path.replace("\\", "/")
+        s3_key = relative_path
     return s3_key
 
 
-def gather_data_paths(config: dict) -> List[Tuple[str, str]]:
+def gather_data_paths(config: dict) -> List[Tuple[Path, str]]:
     """
     Gather all local and corresponding S3 paths for images and labels.
 
@@ -105,31 +123,45 @@ def gather_data_paths(config: dict) -> List[Tuple[str, str]]:
 
     Returns
     -------
-    List[Tuple[str, str]]
+    List[Tuple[Path, str]]
         A list of tuples where each tuple contains (local_path, s3_key).
     """
     data_paths = []
+    data_config = config.get('data', {})
+    base_dir = Path(data_config.get('base_dir', '.')).resolve()
+    s3_prefix = data_config.get('s3_prefix', '')
+    required_keys = ['train_image_pairs', 'train_labels', 'val_image_pairs', 'val_labels']
+
+    # Validate required configuration keys
+    for key in required_keys:
+        if key not in data_config:
+            logger.error("Missing required configuration key in 'data': '%s'", key)
+            sys.exit(1)
 
     # Collect train image pairs
-    for pair in config['data']['train_image_pairs']:
-        for local_path in pair:
-            s3_key = map_s3_key(config['data']['s3_prefix'], local_path)
+    for pair in data_config['train_image_pairs']:
+        for local_path_str in pair:
+            local_path = base_dir / local_path_str
+            s3_key = map_s3_key(s3_prefix, local_path, base_dir)
             data_paths.append((local_path, s3_key))
 
     # Collect train labels
-    for local_path in config['data']['train_labels']:
-        s3_key = map_s3_key(config['data']['s3_prefix'], local_path)
+    for local_path_str in data_config['train_labels']:
+        local_path = base_dir / local_path_str
+        s3_key = map_s3_key(s3_prefix, local_path, base_dir)
         data_paths.append((local_path, s3_key))
 
     # Collect validation image pairs
-    for pair in config['data']['val_image_pairs']:
-        for local_path in pair:
-            s3_key = map_s3_key(config['data']['s3_prefix'], local_path)
+    for pair in data_config['val_image_pairs']:
+        for local_path_str in pair:
+            local_path = base_dir / local_path_str
+            s3_key = map_s3_key(s3_prefix, local_path, base_dir)
             data_paths.append((local_path, s3_key))
 
     # Collect validation labels
-    for local_path in config['data']['val_labels']:
-        s3_key = map_s3_key(config['data']['s3_prefix'], local_path)
+    for local_path_str in data_config['val_labels']:
+        local_path = base_dir / local_path_str
+        s3_key = map_s3_key(s3_prefix, local_path, base_dir)
         data_paths.append((local_path, s3_key))
 
     return data_paths
@@ -150,18 +182,24 @@ def download_data(config: dict, s3_client) -> None:
     total_files = len(data_paths)
     logger.info("Starting download of %d files from S3.", total_files)
 
-    with ThreadPoolExecutor(max_workers=config['data']['num_workers']) as executor:
+    data_config = config.get('data', {})
+    num_workers = data_config.get('num_workers', 4)
+    retry_attempts = data_config.get('retry_attempts', 3)
+    retry_delay = data_config.get('retry_delay', 1.0)
+    s3_bucket = data_config.get('s3_bucket')
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
         future_to_file = {}
         for local_path, s3_key in data_paths:
             create_local_directory(local_path)
             future = executor.submit(
                 download_file_from_s3,
                 s3_client,
-                config['data']['s3_bucket'],
+                s3_bucket,
                 s3_key,
                 local_path,
-                config['data']['retry_attempts'],
-                config['data']['retry_delay']
+                retry_attempts,
+                retry_delay,
             )
             future_to_file[future] = (s3_key, local_path)
 
@@ -188,27 +226,33 @@ def validate_local_data(config: dict) -> None:
         If any of the specified local data files do not exist.
     """
     missing_files = []
+    data_config = config.get('data', {})
+    base_dir = Path(data_config.get('base_dir', '.')).resolve()
 
     # Check train image pairs
-    for pair in config['data']['train_image_pairs']:
-        for local_path in pair:
-            if not os.path.isfile(local_path):
+    for pair in data_config['train_image_pairs']:
+        for local_path_str in pair:
+            local_path = base_dir / local_path_str
+            if not local_path.is_file():
                 missing_files.append(local_path)
 
     # Check train labels
-    for local_path in config['data']['train_labels']:
-        if not os.path.isfile(local_path):
+    for local_path_str in data_config['train_labels']:
+        local_path = base_dir / local_path_str
+        if not local_path.is_file():
             missing_files.append(local_path)
 
     # Check validation image pairs
-    for pair in config['data']['val_image_pairs']:
-        for local_path in pair:
-            if not os.path.isfile(local_path):
+    for pair in data_config['val_image_pairs']:
+        for local_path_str in pair:
+            local_path = base_dir / local_path_str
+            if not local_path.is_file():
                 missing_files.append(local_path)
 
     # Check validation labels
-    for local_path in config['data']['val_labels']:
-        if not os.path.isfile(local_path):
+    for local_path_str in data_config['val_labels']:
+        local_path = base_dir / local_path_str
+        if not local_path.is_file():
             missing_files.append(local_path)
 
     if missing_files:
@@ -223,17 +267,22 @@ def main() -> None:
     Main function to orchestrate the data downloading process.
     """
     # Setup logger
-    logger = setup_logger(__name__, log_dir="logs", log_file="download_data.log", level=logging.INFO)
+    setup_logger(__name__, log_dir="logs", log_file="download_data.log", level=logging.INFO)
     logger.info("Logger initialized successfully.")
 
     # Parse configuration
     config = get_config()
     logger.info("Configuration parsed successfully.")
 
-    if config['data']['use_s3']:
-        if not config['data']['s3_bucket']:
+    data_config = config.get('data', {})
+    use_s3 = data_config.get('use_s3', False)
+    s3_bucket = data_config.get('s3_bucket')
+
+    if use_s3:
+        if not s3_bucket:
             logger.error("S3 bucket name must be provided when 'use_s3' is set to true.")
             sys.exit(1)
+
         # Initialize S3 client
         try:
             s3_client = boto3.client('s3')

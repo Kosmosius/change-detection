@@ -6,18 +6,19 @@
 # Script to Run Model Evaluation
 #
 # This script orchestrates the evaluation process of a trained model. It ensures
-# that the necessary data is downloaded and preprocessed before performing
-# evaluation. The evaluation results, including metrics, are logged for analysis.
+# that the necessary data is available before performing evaluation. The evaluation
+# results, including metrics, are logged for analysis.
 #
 # Usage:
-#   ./run_evaluation.sh [--config CONFIG_PATH] [--checkpoint CHECKPOINT_PATH]
+#   ./run_evaluation.sh [-c CONFIG_PATH] [-k CHECKPOINT_PATH] [-h]
 #
 # Options:
-#   --config CONFIG_PATH         Path to the configuration YAML file (default: config/config.yaml)
-#   --checkpoint CHECKPOINT_PATH Path to the model checkpoint file (default: config/training/checkpoint.pth)
+#   -c CONFIG_PATH         Path to the configuration YAML file (default: config/config.yaml)
+#   -k CHECKPOINT_PATH     Path to the model checkpoint file (default: checkpoints/best_model.pth)
+#   -h                     Display this help message
 #
 # Example:
-#   ./run_evaluation.sh --config config/config.yaml --checkpoint checkpoints/best_model.pth
+#   ./run_evaluation.sh -c config/config.yaml -k checkpoints/best_model.pth
 #
 ###############################################################################
 
@@ -29,37 +30,42 @@ CHECKPOINT_PATH="checkpoints/best_model.pth"
 
 # Function to display usage information
 usage() {
-    echo "Usage: $0 [--config CONFIG_PATH] [--checkpoint CHECKPOINT_PATH]"
+    echo "Usage: $0 [-c CONFIG_PATH] [-k CHECKPOINT_PATH] [-h]"
     echo ""
     echo "Options:"
-    echo "  --config CONFIG_PATH         Path to the configuration YAML file (default: config/config.yaml)"
-    echo "  --checkpoint CHECKPOINT_PATH Path to the model checkpoint file (default: checkpoints/best_model.pth)"
+    echo "  -c CONFIG_PATH         Path to the configuration YAML file (default: config/config.yaml)"
+    echo "  -k CHECKPOINT_PATH     Path to the model checkpoint file (default: checkpoints/best_model.pth)"
+    echo "  -h                     Display this help message"
     echo ""
     echo "Example:"
-    echo "  $0 --config config/config.yaml --checkpoint checkpoints/best_model.pth"
+    echo "  $0 -c config/config.yaml -k checkpoints/best_model.pth"
     exit 1
 }
 
-# Parse command-line arguments
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --config)
-            CONFIG_PATH="$2"
-            shift 2
+# Parse command-line arguments using getopts
+while getopts ":c:k:h" opt; do
+    case "${opt}" in
+        c)
+            CONFIG_PATH="${OPTARG}"
             ;;
-        --checkpoint)
-            CHECKPOINT_PATH="$2"
-            shift 2
+        k)
+            CHECKPOINT_PATH="${OPTARG}"
             ;;
-        --help|-h)
+        h)
             usage
             ;;
-        *)
-            echo "Unknown option: $1"
+        \?)
+            echo "Invalid option: -${OPTARG}" >&2
+            usage
+            ;;
+        :)
+            echo "Option -${OPTARG} requires an argument." >&2
             usage
             ;;
     esac
 done
+
+shift $((OPTIND -1))
 
 # Function to check if a file exists
 check_file_exists() {
@@ -69,54 +75,6 @@ check_file_exists() {
         exit 1
     fi
 }
-
-# Initialize logger
-setup_logger() {
-    local log_dir="$1"
-    local log_file="$2"
-    local log_level="$3"
-
-    mkdir -p "$log_dir"
-
-    # Export PYTHONLOGDIR so that Python scripts can use it
-    export PYTHONLOGDIR="$log_dir"
-
-    # Create a Python logging configuration file
-    cat > "$log_dir/logging.conf" <<EOL
-[loggers]
-keys=root
-
-[handlers]
-keys=consoleHandler,fileHandler
-
-[formatters]
-keys=simpleFormatter
-
-[logger_root]
-level=$log_level
-handlers=consoleHandler,fileHandler
-
-[handler_consoleHandler]
-class=StreamHandler
-level=$log_level
-formatter=simpleFormatter
-args=(sys.stdout,)
-
-[handler_fileHandler]
-class=FileHandler
-level=$log_level
-formatter=simpleFormatter
-args=("$log_dir/$log_file", 'a')
-
-[formatter_simpleFormatter]
-format=%(asctime)s - %(name)s - %(levelname)s - %(message)s
-datefmt=%Y-%m-%d %H:%M:%S
-EOL
-}
-
-# Setup logger
-setup_logger "logs" "run_evaluation.log" "INFO"
-echo "Logger initialized successfully."
 
 # Check if configuration file exists
 check_file_exists "$CONFIG_PATH"
@@ -153,11 +111,21 @@ echo "Starting model evaluation..."
 EVALUATE_SCRIPT="evaluate/evaluate.py"
 if [[ ! -f "$EVALUATE_SCRIPT" ]]; then
     echo "Error: Evaluation script '$EVALUATE_SCRIPT' not found."
-    echo "Please create 'evaluate/evaluate.py' to perform model evaluation."
+    echo "Please ensure that 'evaluate/evaluate.py' exists and is executable."
     exit 1
 fi
 
-# Execute the evaluation script with the provided configuration and checkpoint
-python "$EVALUATE_SCRIPT" --config "$CONFIG_PATH" --checkpoint "$CHECKPOINT_PATH" | tee "logs/evaluation_output.log"
+# Create logs directory if it doesn't exist
+mkdir -p logs
 
-echo "Model evaluation completed successfully."
+# Execute the evaluation script with the provided configuration and checkpoint
+# Redirect both stdout and stderr to log file
+python "$EVALUATE_SCRIPT" --config "$CONFIG_PATH" --checkpoint "$CHECKPOINT_PATH" > "logs/evaluation_output.log" 2>&1
+
+# Check the exit status of the evaluation script
+if [[ $? -ne 0 ]]; then
+    echo "Model evaluation failed. Check 'logs/evaluation_output.log' for details."
+    exit 1
+else
+    echo "Model evaluation completed successfully."
+fi

@@ -61,6 +61,9 @@ class ChangeDetectionTransformer(BaseModel):
         )
         logger.info("Loaded HuggingFace encoder '%s'.", self.encoder_name)
 
+        # Modify the encoder to accept 6-channel input
+        self._modify_encoder_input_channels()
+
         # Apply PEFT if enabled
         if self.use_peft:
             if not self.peft_config:
@@ -76,6 +79,43 @@ class ChangeDetectionTransformer(BaseModel):
         # Define decoder layers based on decoder_config
         self.decoder: nn.Module = self._build_decoder()
         logger.info("Initialized decoder layers.")
+
+    def _modify_encoder_input_channels(self) -> None:
+        """
+        Modifies the encoder's first convolutional layer to accept 6 input channels instead of 3.
+        Initializes the new channels by copying the weights from the original 3 channels.
+        """
+        # Access the encoder's patch embedding layer
+        try:
+            orig_conv = self.encoder.embeddings.patch_embeddings.proj
+            logger.debug("Original patch embedding conv: %s", orig_conv)
+        except AttributeError as e:
+            logger.error("Failed to access the encoder's patch embedding layer: %s", e)
+            raise ValueError("Encoder does not have the expected patch_embeddings.proj layer.")
+
+        # Create a new Conv2d layer with 6 input channels
+        new_conv = nn.Conv2d(
+            in_channels=6,
+            out_channels=orig_conv.out_channels,
+            kernel_size=orig_conv.kernel_size,
+            stride=orig_conv.stride,
+            padding=orig_conv.padding,
+            bias=orig_conv.bias is not None
+        )
+
+        # Initialize the new_conv's weights
+        with torch.no_grad():
+            # Copy weights for the original 3 channels
+            new_conv.weight[:, :3, :, :] = orig_conv.weight
+            # Initialize the new 3 channels by copying the original weights
+            new_conv.weight[:, 3:, :, :] = orig_conv.weight
+            # If bias exists, copy it
+            if orig_conv.bias is not None:
+                new_conv.bias = orig_conv.bias
+
+        # Replace the original conv with the new conv
+        self.encoder.embeddings.patch_embeddings.proj = new_conv
+        logger.info("Modified encoder to accept 6-channel input.")
 
     def _build_decoder(self) -> nn.Module:
         """
@@ -133,7 +173,7 @@ class ChangeDetectionTransformer(BaseModel):
             raise ValueError("Input tensors must be 4-dimensional (batch_size, channels, height, width).")
 
         # Concatenate before and after images along the channel dimension
-        x = torch.cat((x_before, x_after), dim=1)  # Shape: (batch_size, channels*2, H, W)
+        x = torch.cat((x_before, x_after), dim=1)  # Shape: (batch_size, 6, H, W)
 
         # Prepare inputs for the encoder
         # Assuming the encoder expects inputs under the key 'pixel_values'
@@ -145,7 +185,9 @@ class ChangeDetectionTransformer(BaseModel):
         logits = logits.unsqueeze(-1).unsqueeze(-1)  # Shape: (batch_size, num_classes, 1, 1)
 
         # Upsample logits to match input dimensions
-        logits = nn.functional.interpolate(logits, size=x_before.shape[2:], mode='bilinear', align_corners=False)
+        logits = nn.functional.interpolate(
+            logits, size=x_before.shape[2:], mode='bilinear', align_corners=False
+        )  # Shape: (batch_size, num_classes, H, W)
 
         return logits
 
@@ -157,7 +199,7 @@ class ChangeDetectionTransformer(BaseModel):
             Tuple[int, int, int]: Input size in the format (channels, height, width).
         """
         # The input size depends on the encoder's expected input size
-        # For 'google/vit-base-patch16-224', the input size is (3, 224, 224)
+        # For 'google/vit-base-patch16-224', the input size is (6, 224, 224)
         # Since we concatenate before and after images, channels are doubled
         return (6, 224, 224)
 

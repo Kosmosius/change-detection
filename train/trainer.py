@@ -156,9 +156,9 @@ class CustomTrainer:
         for metric in self.metrics:
             metric.reset()
 
-        for batch_idx, (inputs, targets) in enumerate(train_loader):
-            inputs = self._move_to_device(inputs)
-            targets = targets.to(self.device)
+        for batch_idx, batch in enumerate(train_loader):
+            inputs = self._move_to_device(batch)
+            targets = batch['labels'].to(self.device)
 
             # Forward pass
             self.optimizer.zero_grad()
@@ -217,9 +217,9 @@ class CustomTrainer:
             metric.reset()
 
         with torch.no_grad():
-            for batch_idx, (inputs, targets) in enumerate(val_loader):
-                inputs = self._move_to_device(inputs)
-                targets = targets.to(self.device)
+            for batch_idx, batch in enumerate(val_loader):
+                inputs = self._move_to_device(batch)
+                targets = batch['labels'].to(self.device)
 
                 outputs = self._model_forward(inputs)
                 loss = self.loss_fn(outputs, targets)
@@ -242,43 +242,40 @@ class CustomTrainer:
 
         return avg_loss
 
-    def _move_to_device(self, inputs):
+    def _move_to_device(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Move inputs to the configured device.
 
         Parameters
         ----------
-        inputs : Any
-            Input data, can be a tensor or a list/tuple of tensors.
+        batch : Dict[str, torch.Tensor]
+            Batch data containing 'x_before' and 'x_after'.
 
         Returns
         -------
-        Any
-            Inputs moved to the device.
+        Tuple[torch.Tensor, torch.Tensor]
+            Tuple containing 'x_before' and 'x_after' tensors moved to the device.
         """
-        if isinstance(inputs, (list, tuple)):
-            return [input_tensor.to(self.device) for input_tensor in inputs]
-        else:
-            return inputs.to(self.device)
+        x_before = batch['x_before'].to(self.device)
+        x_after = batch['x_after'].to(self.device)
+        return x_before, x_after
 
-    def _model_forward(self, inputs):
+    def _model_forward(self, inputs: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         """
         Perform a forward pass with the model.
 
         Parameters
         ----------
-        inputs : Any
-            Input data, can be a tensor or a list/tuple of tensors.
+        inputs : Tuple[torch.Tensor, torch.Tensor]
+            Tuple containing 'x_before' and 'x_after' tensors.
 
         Returns
         -------
         torch.Tensor
             Model outputs.
         """
-        if isinstance(inputs, (list, tuple)):
-            return self.model(*inputs)
-        else:
-            return self.model(inputs)
+        x_before, x_after = inputs
+        return self.model(x_before, x_after)
 
 
 class HuggingFaceTrainer:
@@ -349,13 +346,13 @@ class HuggingFaceTrainer:
         )
 
         # Define compute_metrics function
-        def compute_metrics(eval_pred: Tuple[torch.Tensor, torch.Tensor]) -> Dict[str, float]:
+        def compute_metrics(eval_pred: Tuple[Any, Any]) -> Dict[str, float]:
             """
             Compute metrics based on model predictions and targets.
 
             Parameters
             ----------
-            eval_pred : Tuple[torch.Tensor, torch.Tensor]
+            eval_pred : Tuple[Any, Any]
                 Tuple containing logits and labels.
 
             Returns
@@ -363,14 +360,17 @@ class HuggingFaceTrainer:
             Dict[str, float]
                 Dictionary of computed metric values.
             """
-            logits, labels = eval_pred
-            logits = torch.tensor(logits)
+            preds, labels = eval_pred
+            preds = torch.tensor(preds)
             labels = torch.tensor(labels)
+
+            # Apply threshold if necessary (assuming binary classification)
+            preds = preds > 0.5
 
             metric_results = {}
             for metric in self.metrics:
                 metric.reset()
-                metric.update(logits, labels)
+                metric.update(preds, labels)
                 metric_value = metric.compute()
                 metric_name = metric.__class__.__name__.lower()
                 metric_results[metric_name] = metric_value
@@ -384,7 +384,7 @@ class HuggingFaceTrainer:
             eval_dataset=self.hf_val_dataset,
             compute_metrics=compute_metrics,
             tokenizer=None,  # Assuming the model doesn't require tokenization
-            optimizers=(self.optimizer, None),
+            optimizers=(self.optimizer, None),  # Let Trainer handle scheduler if needed
         )
         logger.info("HuggingFace Trainer initialized successfully.")
 

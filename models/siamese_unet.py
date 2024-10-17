@@ -93,42 +93,45 @@ class Up(nn.Module):
     followed by DoubleConv.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, bilinear: bool = True):
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int, bilinear: bool = True):
         """
         Initializes the Up module.
 
         Args:
-            in_channels (int): Number of input channels.
-            out_channels (int): Number of output channels.
+            in_channels (int): Number of input channels from the previous layer.
+            skip_channels (int): Number of channels from the skip connection.
+            out_channels (int): Number of output channels after DoubleConv.
             bilinear (bool): Whether to use bilinear upsampling. If False, uses transposed convolution.
         """
         super().__init__()
 
         if bilinear:
             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            self.conv = DoubleConv(in_channels * 2, out_channels, use_batch_norm=True)
         else:
-            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-            self.conv = DoubleConv(in_channels, out_channels, use_batch_norm=True)
+            self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+
+        self.conv = DoubleConv(in_channels + skip_channels, out_channels, use_batch_norm=True)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the Up module.
 
         Args:
-            x1 (torch.Tensor): Input tensor from the previous layer, shape (N, C, H, W).
-            x2 (torch.Tensor): Skip connection tensor from the encoder, shape (N, C, H, W).
+            x1 (torch.Tensor): Input tensor from the previous layer, shape (N, in_channels, H, W).
+            x2 (torch.Tensor): Skip connection tensor from the encoder, shape (N, skip_channels, H*2, W*2).
 
         Returns:
             torch.Tensor: Output tensor after upsampling and convolution, shape (N, out_channels, H*2, W*2).
         """
         x1 = self.up(x1)
+        logger.debug(f"After upsampling: {x1.shape}")
 
         # Ensure the spatial dimensions match
         diffY = x2.size(2) - x1.size(2)
         diffX = x2.size(3) - x1.size(3)
 
         if diffY != 0 or diffX != 0:
+            logger.debug(f"Padding: diffY={diffY}, diffX={diffX}")
             x1 = F.pad(
                 x1,
                 [diffX // 2, diffX - diffX // 2,
@@ -136,9 +139,12 @@ class Up(nn.Module):
                 mode='constant',
                 value=0
             )
+            logger.debug(f"After padding: {x1.shape}")
 
         # Concatenate along the channels dimension
         x = torch.cat([x2, x1], dim=1)
+        logger.debug(f"After concatenation: {x.shape}")
+
         return self.conv(x)
 
 
@@ -187,7 +193,7 @@ class SiameseUNet(BaseModel):
         self.use_batch_norm = use_batch_norm
         self.bilinear = bilinear
 
-        # Encoder
+        # Shared Encoder
         self.inc = DoubleConv(2 * self.in_channels, self.feature_maps[0], use_batch_norm)
         self.down1 = Down(self.feature_maps[0], self.feature_maps[1], use_batch_norm)
         self.down2 = Down(self.feature_maps[1], self.feature_maps[2], use_batch_norm)
@@ -196,10 +202,25 @@ class SiameseUNet(BaseModel):
         # Bottleneck
         self.bottleneck = DoubleConv(self.feature_maps[3], self.feature_maps[3], use_batch_norm)
 
-        # Decoder
-        self.up1 = Up(self.feature_maps[3], self.feature_maps[2], bilinear)
-        self.up2 = Up(self.feature_maps[2], self.feature_maps[1], bilinear)
-        self.up3 = Up(self.feature_maps[1], self.feature_maps[0], bilinear)
+        # Decoder with correct skip connections
+        self.up1 = Up(
+            in_channels=self.feature_maps[3],
+            skip_channels=self.feature_maps[2],
+            out_channels=self.feature_maps[2],
+            bilinear=bilinear
+        )
+        self.up2 = Up(
+            in_channels=self.feature_maps[2],
+            skip_channels=self.feature_maps[1],
+            out_channels=self.feature_maps[1],
+            bilinear=bilinear
+        )
+        self.up3 = Up(
+            in_channels=self.feature_maps[1],
+            skip_channels=self.feature_maps[0],
+            out_channels=self.feature_maps[0],
+            bilinear=bilinear
+        )
 
         # Final Convolution
         self.outc = nn.Conv2d(self.feature_maps[0], self.out_channels, kernel_size=1)
@@ -228,24 +249,34 @@ class SiameseUNet(BaseModel):
             raise ValueError("Input tensors must be 4-dimensional (N, C, H, W).")
 
         # Concatenate the two images along the channel dimension
-        x = torch.cat([img1, img2], dim=1)  # Shape: [N, 2*C, H, W]
+        x = torch.cat([img1, img2], dim=1)  # Shape: [N, 6, 256, 256]
+        logger.debug(f"After concatenation: {x.shape}")
 
         # Encoder
-        x1 = self.inc(x)           # [64, H, W]
-        x1_down1 = self.down1(x1) # [128, H/2, W/2]
-        x1_down2 = self.down2(x1_down1) # [256, H/4, W/4]
-        x1_down3 = self.down3(x1_down2) # [512, H/8, W/8]
+        x1 = self.inc(x)           # [64, 256, 256]
+        logger.debug(f"After inc: {x1.shape}")
+        x1_down1 = self.down1(x1) # [128, 128, 128]
+        logger.debug(f"After down1: {x1_down1.shape}")
+        x1_down2 = self.down2(x1_down1) # [256, 64, 64]
+        logger.debug(f"After down2: {x1_down2.shape}")
+        x1_down3 = self.down3(x1_down2) # [512, 32, 32]
+        logger.debug(f"After down3: {x1_down3.shape}")
 
         # Bottleneck
-        x_bottleneck = self.bottleneck(x1_down3) # [512, H/8, W/8]
+        x_bottleneck = self.bottleneck(x1_down3) # [512, 32, 32]
+        logger.debug(f"After bottleneck: {x_bottleneck.shape}")
 
-        # Decoder with skip connections
-        x = self.up1(x_bottleneck, x1_down3) # [256, H/4, W/4]
-        x = self.up2(x, x1_down2)            # [128, H/2, W/2]
-        x = self.up3(x, x1_down1)            # [64, H, W]
+        # Decoder with correct skip connections
+        x = self.up1(x_bottleneck, x1_down2) # [256, 64, 64]
+        logger.debug(f"After up1: {x.shape}")
+        x = self.up2(x, x1_down1)            # [128, 128, 128]
+        logger.debug(f"After up2: {x.shape}")
+        x = self.up3(x, x1)                   # [64, 256, 256]
+        logger.debug(f"After up3: {x.shape}")
 
-        # Final output layer
-        logits = self.outc(x)                # [1, H, W]
+        # Output layer
+        logits = self.outc(x)                # [1, 256, 256]
+        logger.debug(f"Logits shape: {logits.shape}")
 
         return logits
 
@@ -261,7 +292,7 @@ class SiameseUNet(BaseModel):
 
     def freeze_encoder(self) -> None:
         """
-        Freezes the encoder parameters to prevent them from being updated during training.
+        Frees the encoder parameters to prevent them from being updated during training.
         """
         for module in [self.inc, self.down1, self.down2, self.down3, self.bottleneck]:
             for param in module.parameters():

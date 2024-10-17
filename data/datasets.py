@@ -1,21 +1,25 @@
 # data/datasets.py
 
 import os
-import time  # Added missing import for time.sleep
+import time
 from pathlib import Path
 from typing import List, Tuple, Optional, Union
-from PIL import Image, ImageFile
+import logging
+
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
+import numpy as np
+from PIL import Image, ImageFile
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
 from .s3_data_loader import S3DataLoader
-import logging
 
 # To handle truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 logger = logging.getLogger(__name__)
-
 
 class ChangeDetectionDataset(Dataset):
     """
@@ -29,7 +33,7 @@ class ChangeDetectionDataset(Dataset):
         self,
         image_pairs: List[Tuple[str, str]],
         labels: List[str],
-        transform: Optional[transforms.Compose] = None,
+        transform: Optional[A.Compose] = None,
         use_s3: bool = False,
         s3_bucket: Optional[str] = None,
         s3_prefix: Optional[str] = None,
@@ -44,7 +48,7 @@ class ChangeDetectionDataset(Dataset):
         Args:
             image_pairs (List[Tuple[str, str]]): List of tuples containing paths to before and after images.
             labels (List[str]): List of paths to label images.
-            transform (Optional[transforms.Compose]): Transformations to apply to the images.
+            transform (Optional[A.Compose]): Transformations to apply to the images.
             use_s3 (bool): Whether to load images from AWS S3.
             s3_bucket (Optional[str]): S3 bucket name.
             s3_prefix (Optional[str]): S3 prefix/path.
@@ -97,7 +101,7 @@ class ChangeDetectionDataset(Dataset):
         Returns:
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
                 - Tuple of before and after images as tensors.
-                - Label image as a tensor.
+                - Label image as a tensor with shape [1, H, W].
 
         Raises:
             FileNotFoundError: If image files are not found.
@@ -115,11 +119,46 @@ class ChangeDetectionDataset(Dataset):
             logger.error("Error loading images for index %d: %s", idx, e)
             raise
 
-        # Apply transformations with optional caching
-        if self.transform:
-            before_img, after_img, label_img = self._apply_transforms(idx, before_img, after_img, label_img)
+        # Convert images to numpy arrays
+        before_img = np.array(before_img)
+        after_img = np.array(after_img)
+        label_img = np.array(label_img)
 
-        return (before_img, after_img), label_img
+        # Apply transformations with optional caching
+        if self.cache_transforms:
+            cache_path = self.transform_cache_dir / f"{idx}.pt"
+            if cache_path.is_file():
+                try:
+                    before_tensor, after_tensor, label_tensor = torch.load(cache_path)
+                    logger.debug("Loaded transformed images from cache for index %d.", idx)
+                    return (before_tensor, after_tensor), label_tensor
+                except (OSError, IOError) as e:
+                    logger.warning("Failed to load cached transforms for index %d: %s. Re-transforming.", idx, e)
+
+        # Apply the same transformations to images and labels
+        if self.transform:
+            transformed = self.transform(image=before_img, image0=after_img, mask=label_img)
+            before_img = transformed['image']    # Tensor of shape [C, H, W]
+            after_img = transformed['image0']    # Tensor of shape [C, H, W]
+            label_img = transformed['mask']      # Tensor of shape [H, W]
+
+        # Ensure label has shape [1, H, W] and type float32
+        if label_img.dim() == 2:
+            label_tensor = label_img.unsqueeze(0).float()
+        elif label_img.dim() == 3 and label_img.shape[0] == 1:
+            label_tensor = label_img.float()
+        else:
+            logger.warning("Unexpected label shape: %s", label_img.shape)
+            label_tensor = label_img.unsqueeze(0).float()
+
+        if self.cache_transforms:
+            try:
+                torch.save((before_img, after_img, label_tensor), cache_path)
+                logger.debug("Saved transformed images to cache for index %d.", idx)
+            except (OSError, IOError) as e:
+                logger.warning("Failed to save transformed images to cache for index %d: %s.", idx, e)
+
+        return (before_img, after_img), label_tensor
 
     def _load_image(self, path: str, mode: str = "RGB") -> Image.Image:
         """
@@ -152,74 +191,25 @@ class ChangeDetectionDataset(Dataset):
                     logger.error("All %d attempts failed to load image '%s'.", self.retry_attempts, path)
                     raise
 
-    def _apply_transforms(
-        self,
-        idx: int,
-        before_img: Image.Image,
-        after_img: Image.Image,
-        label_img: Image.Image
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Applies transformations to the images with optional caching.
+def get_default_transforms():
+    """
+    Returns the default transformations for the dataset using albumentations.
 
-        Ensures that the same random transformations are applied to both images and labels.
-
-        Args:
-            idx (int): Index of the sample.
-            before_img (Image.Image): Before image.
-            after_img (Image.Image): After image.
-            label_img (Image.Image): Label image.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Transformed before, after, and label images.
-        """
-        if self.cache_transforms:
-            cache_path = self.transform_cache_dir / f"{idx}.pt"
-            if cache_path.is_file():
-                try:
-                    before_tensor, after_tensor, label_tensor = torch.load(cache_path)
-                    logger.debug("Loaded transformed images from cache for index %d.", idx)
-                    return before_tensor, after_tensor, label_tensor
-                except (OSError, IOError) as e:
-                    logger.warning("Failed to load cached transforms for index %d: %s. Re-transforming.", idx, e)
-
-        # Apply the same transformations to images and labels
-        seed = torch.randint(0, 2**32, (1,)).item()
-
-        torch.manual_seed(seed)
-        before_tensor = self.transform(before_img)
-
-        torch.manual_seed(seed)
-        after_tensor = self.transform(after_img)
-
-        torch.manual_seed(seed)
-        # For labels, we need to ensure that ToTensor does not normalize the data
-        label_transform = transforms.Compose([
-            transforms.Resize(self.transform.transforms[0].size),
-            transforms.RandomHorizontalFlip() if any(isinstance(t, transforms.RandomHorizontalFlip) for t in self.transform.transforms) else None,
-            transforms.RandomVerticalFlip() if any(isinstance(t, transforms.RandomVerticalFlip) for t in self.transform.transforms) else None,
-            transforms.RandomRotation(self.transform.transforms[2].degrees) if any(isinstance(t, transforms.RandomRotation) for t in self.transform.transforms) else None,
-            transforms.ToTensor()
-        ])
-        label_transform.transforms = [t for t in label_transform.transforms if t is not None]
-        label_tensor = label_transform(label_img).long().squeeze(0)  # Convert to tensor without normalization
-
-        if self.cache_transforms:
-            try:
-                torch.save((before_tensor, after_tensor, label_tensor), cache_path)
-                logger.debug("Saved transformed images to cache for index %d.", idx)
-            except (OSError, IOError) as e:
-                logger.warning("Failed to save transformed images to cache for index %d: %s.", idx, e)
-
-        return before_tensor, after_tensor, label_tensor
-
+    The transformations are applied to both images and labels, ensuring consistency.
+    """
+    return A.Compose([
+        A.Resize(height=256, width=256),
+        A.HorizontalFlip(p=0.5),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2()
+    ], additional_targets={'image0': 'image', 'mask': 'mask'})
 
 def get_dataloader(
     image_pairs: List[Tuple[str, str]],
     labels: List[str],
     batch_size: int = 32,
     shuffle: bool = True,
-    transform: Optional[transforms.Compose] = None,
+    transform: Optional[A.Compose] = None,
     use_s3: bool = False,
     s3_bucket: Optional[str] = None,
     s3_prefix: Optional[str] = None,
@@ -237,7 +227,7 @@ def get_dataloader(
         labels (List[str]): List of label paths.
         batch_size (int, optional): Number of samples per batch. Defaults to 32.
         shuffle (bool, optional): Whether to shuffle the data. Defaults to True.
-        transform (Optional[transforms.Compose], optional): Transformations to apply. Defaults to None.
+        transform (Optional[A.Compose], optional): Transformations to apply. Defaults to None.
         use_s3 (bool, optional): Whether to load images from AWS S3. Defaults to False.
         s3_bucket (Optional[str], optional): S3 bucket name. Defaults to None.
         s3_prefix (Optional[str], optional): S3 prefix/path. Defaults to None.
@@ -253,8 +243,6 @@ def get_dataloader(
     Raises:
         ValueError: If required parameters are missing.
     """
-    from .transforms import get_default_transforms  # Import from transforms module
-
     if transform is None:
         transform = get_default_transforms()
 

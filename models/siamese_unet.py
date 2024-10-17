@@ -68,30 +68,20 @@ class Down(nn.Module):
 
 
 class Up(nn.Module):
-    """
-    A module for upsampling that applies transposed convolution (upscaling)
-    followed by DoubleConv.
-    """
+    """Upscaling then double conv"""
 
-    def __init__(
-        self, in_channels: int, out_channels: int, use_batch_norm: bool = True, bilinear: bool = True
-    ):
-        """
-        Initializes the Up module.
-
-        Args:
-            in_channels (int): Number of input channels.
-            out_channels (int): Number of output channels.
-            use_batch_norm (bool): Whether to use batch normalization.
-            bilinear (bool): Whether to use bilinear upsampling. If False, uses transposed convolution.
-        """
+    def __init__(self, in_channels: int, out_channels: int, bilinear: bool = True):
         super().__init__()
+
+        # When using bilinear upsampling, the number of channels remains the same after upsampling
         if bilinear:
             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            self.conv = DoubleConv(in_channels, out_channels, use_batch_norm)
+            # After concatenation, channels become in_channels (from x1) + in_channels (from x2)
+            self.conv = DoubleConv(in_channels * 2, out_channels)
         else:
+            # When using ConvTranspose2d, in_channels are reduced, and concatenation results in in_channels
             self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-            self.conv = DoubleConv(in_channels, out_channels, use_batch_norm)
+            self.conv = DoubleConv(in_channels, out_channels)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         x1 = self.up(x1)
@@ -105,6 +95,7 @@ class Up(nn.Module):
                 [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2],
             )
 
+        # Concatenate along the channels dimension
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
@@ -124,17 +115,6 @@ class SiameseUNet(BaseModel):
         bilinear: bool = True,
         device: Optional[torch.device] = None,
     ):
-        """
-        Initializes the SiameseUNet model.
-
-        Args:
-            in_channels (int): Number of input channels for each image.
-            out_channels (int): Number of output channels.
-            feature_maps (Optional[List[int]]): Number of feature maps at each layer.
-            use_batch_norm (bool): Whether to use batch normalization.
-            bilinear (bool): Whether to use bilinear upsampling in the decoder.
-            device (Optional[torch.device]): Device to run the model on.
-        """
         super().__init__(device=device)
 
         if feature_maps is None:
@@ -155,16 +135,10 @@ class SiameseUNet(BaseModel):
         # Bottleneck
         self.bottleneck = DoubleConv(self.feature_maps[3], self.feature_maps[3], use_batch_norm)
 
-        # Decoder
-        self.up1 = Up(
-            self.feature_maps[3] * 2, self.feature_maps[2], use_batch_norm, bilinear
-        )
-        self.up2 = Up(
-            self.feature_maps[2] * 2, self.feature_maps[1], use_batch_norm, bilinear
-        )
-        self.up3 = Up(
-            self.feature_maps[1] * 2, self.feature_maps[0], use_batch_norm, bilinear
-        )
+        # Decoder (Adjust in_channels for Up modules)
+        self.up1 = Up(self.feature_maps[3], self.feature_maps[2], bilinear)
+        self.up2 = Up(self.feature_maps[2], self.feature_maps[1], bilinear)
+        self.up3 = Up(self.feature_maps[1], self.feature_maps[0], bilinear)
 
         # Final Convolution
         self.outc = nn.Conv2d(self.feature_maps[0], self.out_channels, kernel_size=1)

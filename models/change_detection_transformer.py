@@ -86,12 +86,41 @@ class ChangeDetectionTransformer(BaseModel):
         Initializes the new channels by copying the weights from the original 3 channels.
         """
         # Access the encoder's patch embedding layer
-        try:
-            orig_conv = self.encoder.embeddings.patch_embeddings.proj
-            logger.debug("Original patch embedding conv: %s", orig_conv)
-        except AttributeError as e:
-            logger.error("Failed to access the encoder's patch embedding layer: %s", e)
-            raise ValueError("Encoder does not have the expected patch_embeddings.proj layer.")
+        patch_embeddings = self.encoder.embeddings.patch_embeddings
+
+        # Determine the attribute name for the convolutional layer
+        conv_layer = None
+        possible_conv_names = ['proj', 'conv']  # Common names
+
+        for attr in possible_conv_names:
+            if hasattr(patch_embeddings, attr):
+                conv_layer = getattr(patch_embeddings, attr)
+                logger.debug(f"Found convolutional layer '{attr}' in patch_embeddings.")
+                break
+
+        if conv_layer is None:
+            logger.error(
+                f"Failed to find a convolutional layer in patch_embeddings. "
+                f"Available attributes: {list(patch_embeddings.__dict__.keys())}"
+            )
+            raise ValueError(
+                "Encoder does not have a 'proj' or 'conv' attribute in patch_embeddings. "
+                "Please verify the encoder architecture."
+            )
+
+        # Ensure the found layer is an instance of nn.Conv2d
+        if not isinstance(conv_layer, nn.Conv2d):
+            logger.error(
+                f"The attribute '{attr}' in patch_embeddings is not a Conv2d layer. "
+                f"Found type: {type(conv_layer)}"
+            )
+            raise ValueError(
+                f"The attribute '{attr}' in patch_embeddings is not a Conv2d layer. "
+                f"Found type: {type(conv_layer)}"
+            )
+
+        orig_conv = conv_layer
+        logger.debug("Original patch embedding conv: %s", orig_conv)
 
         # Create a new Conv2d layer with 6 input channels
         new_conv = nn.Conv2d(
@@ -114,7 +143,7 @@ class ChangeDetectionTransformer(BaseModel):
                 new_conv.bias = orig_conv.bias
 
         # Replace the original conv with the new conv
-        self.encoder.embeddings.patch_embeddings.proj = new_conv
+        setattr(patch_embeddings, attr, new_conv)
         logger.info("Modified encoder to accept 6-channel input.")
 
     def _build_decoder(self) -> nn.Module:
